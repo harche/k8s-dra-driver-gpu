@@ -51,6 +51,10 @@ type deviceHealthMonitor interface {
 	Start(context.Context) error
 	Stop()
 	Unhealthy() <-chan *DeviceHealthEvent
+	// Heartbeat signals that the monitor's event loop is alive; the driver
+	// re-sends its health report to the kubelet on each heartbeat so the
+	// kubelet's health data does not go stale.
+	Heartbeat() <-chan struct{}
 	// Allows the driver to query the HealthMonitor's health policy
 	IsEventNonFatal(event *DeviceHealthEvent) bool
 }
@@ -63,13 +67,26 @@ type driver struct {
 	healthcheck         *healthcheck
 	deviceHealthMonitor deviceHealthMonitor
 	wg                  sync.WaitGroup
+	nodeName            string
+	// deviceHealth tracks the per-device health reported to the kubelet
+	// through WatchHealthStatus (see device_health_status.go).
+	healthMu     sync.RWMutex
+	deviceHealth map[string]kubeletplugin.DeviceHealth
+	// pendingHealthEvents holds health events drained from the monitor
+	// during initDeviceHealth; deviceHealthEvents applies their taints
+	// before consuming the monitor's channel.
+	pendingHealthEvents []*DeviceHealthEvent
+	healthSubMu         sync.RWMutex
+	// healthSubscribers holds one capacity-one notification channel per
+	// pending WatchHealthStatus call (see notifyHealthSubscribers).
+	healthSubscribers []chan struct{}
 	// Idicates whether to use separate ResourceSlices for SharedCounters and
 	// Devices (required for k8s 1.35+) or combined SharedCounters and Devices
 	// in the same slice (required for k8s 1.34).
 	useSplitResourceSlices bool
 }
 
-func NewDriver(ctx context.Context, config *Config) (*driver, error) {
+func NewDriver(ctx context.Context, config *Config) (_ *driver, retErr error) {
 	state, err := NewDeviceState(ctx, config)
 	if err != nil {
 		return nil, err
@@ -128,24 +145,41 @@ func NewDriver(ctx context.Context, config *Config) (*driver, error) {
 		state:                  state,
 		pulock:                 flock.NewFlock(puLockPath),
 		useSplitResourceSlices: useSplitSlices,
+		nodeName:               config.flags.nodeName,
 	}
-
 	// Register NVML events before kubeletplugin.Start exposes Prepare/Unprepare.
-	// On plugin restart, previously prepared devices and their workloads can remain
-	// live and emit an XID before the kubelet service is available. NVML does not
-	// retain events that occur before registration.
+	// On plugin restart, previously prepared devices and their workloads can
+	// remain live and emit an XID before the kubelet service is available. NVML
+	// does not retain events that occur before registration, so registration
+	// happens here; the event wait loop is started later (after the initial
+	// ResourceSlice publish) by the consumer block below.
 	if featuregates.Enabled(featuregates.NVMLDeviceHealthCheck) {
 		deviceHealthMonitor, err := newNvmlDeviceHealthMonitor(config, state.perGPUAllocatable, state.nvdevlib)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create NVML device health monitor: %w", err)
 		}
 		driver.deviceHealthMonitor = deviceHealthMonitor
+		// Stop the monitor again if any of the later setup steps fail, so
+		// that error returns do not leak its run goroutine and NVML state.
+		defer func() {
+			if retErr != nil {
+				deviceHealthMonitor.Stop()
+			}
+		}()
 
 		// Events recorded after registration remain queued until Start begins
 		// waiting after the kubelet helper is available.
 		if err := deviceHealthMonitor.RegisterEvents(); err != nil {
 			return nil, fmt.Errorf("failed to register NVML device events: %w", err)
 		}
+
+		// Seed the device health map (KEP-4680) after registration and before
+		// the consumer goroutine starts: the kubelet may subscribe to health
+		// updates as soon as the plugin registers, and the initial snapshot
+		// comes from this map. Devices RegisterEvents could not register are
+		// already reflected as unmonitored. Without the feature gate nothing
+		// reads the map, so seeding stays inside this block.
+		driver.initDeviceHealth()
 	}
 
 	opts := []kubeletplugin.Option{
@@ -155,6 +189,10 @@ func NewDriver(ctx context.Context, config *Config) (*driver, error) {
 		kubeletplugin.Serialize(false),
 		kubeletplugin.RegistrarDirectoryPath(config.flags.kubeletRegistrarDirectoryPath),
 		kubeletplugin.PluginDataDirectoryPath(config.DriverPluginPath()),
+		// KEP-4680: device health is reported to the kubelet only when the
+		// NVML health monitor is enabled; otherwise the DRAResourceHealth
+		// service is not advertised.
+		kubeletplugin.HealthService(featuregates.Enabled(featuregates.NVMLDeviceHealthCheck)),
 	}
 	// KEP-5304: Enable Device Metadata support for the kubelet plugin implementation.
 	// See: https://github.com/kubernetes/enhancements/tree/master/keps/sig-node/5304-dra-attributes-downward-api
@@ -401,10 +439,6 @@ func (d *driver) HandleError(ctx context.Context, err error, msg string) {
 	runtime.HandleErrorWithContext(ctx, err, msg)
 }
 
-func (d *driver) WatchHealthStatus(context.Context, chan<- kubeletplugin.DeviceHealthReport) error {
-	return kubeletplugin.ErrHealthNotSupported
-}
-
 func (d *driver) nodePrepareResource(ctx context.Context, claim *resourceapi.ResourceClaim) kubeletplugin.PrepareResult {
 	t0 := time.Now()
 	// Instead of a global prepare/unprepare (PU) lock, we could rely on
@@ -534,11 +568,31 @@ func (d *driver) publishResources(ctx context.Context, config *Config) error {
 
 func (d *driver) deviceHealthEvents(ctx context.Context) {
 	klog.V(4).Info("Starting to watch for device health notifications")
+
+	// Events drained during initDeviceHealth already updated the health map;
+	// they still need their ResourceSlice taints applied.
+	pending := d.pendingHealthEvents
+	d.pendingHealthEvents = nil
+	for _, event := range pending {
+		if ctx.Err() != nil {
+			return
+		}
+		d.applyHealthEventTaint(ctx, event)
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			klog.V(6).Info("Stop processing device health notifications")
 			return
+		case <-d.deviceHealthMonitor.Heartbeat():
+			// The monitor's event loop is alive: refresh the health
+			// timestamps and wake the health watchers to re-send the report
+			// so the kubelet's health data does not go stale (the kubelet
+			// reports device health as unknown once it is older than the
+			// health check timeout).
+			d.refreshDeviceHealth()
+			continue
 		case event, ok := <-d.deviceHealthMonitor.Unhealthy():
 			if !ok {
 				// NVML based deviceHealthMonitor is expected to close only during driver Shutdown.
@@ -546,44 +600,54 @@ func (d *driver) deviceHealthEvents(ctx context.Context) {
 				return
 			}
 
-			taint := healthEventToTaint(d.deviceHealthMonitor, event)
-			modified := false
-			for _, dev := range event.Devices {
-				klog.Warningf("Received %s health event for device %s", event.EventType, dev.CanonicalName())
-				if d.state.AddDeviceTaint(dev, taint) {
-					modified = true
-				}
-			}
-			if !modified {
-				continue
-			}
-
-			// NOTE: We only log an error on publish failure and do not retry.
-			// If this publish fails, our in-memory health update succeeds but the
-			// ResourceSlice in the API server remains stale and still advertises the
-			// now-unhealthy device as allocatable. Until a later publish succeeds,
-			// the scheduler and other consumers will continue to see the unhealthy
-			// device as available, and new pods may be placed onto hardware we know
-			// is unusable. If publishes continue to fail (e.g., API server issues),
-			// the cluster can remain in this inconsistent state indefinitely.
-			// This is a temporary compromise while device taints/tolerations (KEP-5055)
-			// are available as a Beta feature. An interim improvement could be adding
-			// a retry/backoff or switch to patch updates instead of full republish.
-			klog.V(4).Infof("Republishing ResourceSlice: %d device(s) tainted with %s=%q (effect=%s)",
-				len(event.Devices), taint.Key, taint.Value, taint.Effect)
-
-			// NOTE: GPU_LOST and unmonitored events are already batched at the
-			// sender (all affected devices arrive in a single DeviceHealthEvent).
-			// XID events are still per-device and may cause repeated publishes.
-			// TODO: Add receiver-side event aggregation before PublishResources.
-			// Evaluate two strategies:
-			// 1. Channel drain: non-blocking pull of all pending events (Pro: zero latency; Con: susceptible to NVML lag).
-			// 2. Timer debounce: e.g., 50ms window (Pro: standard K8s API protection; Con: slight delay).
-			// This also needs to be handled properly in the recovery path.
-			if err := d.publishResources(ctx, d.state.config); err != nil {
-				klog.Errorf("Failed to publish resources after taint update: %v", err)
-			}
+			// Surface the event in the device health reported to the kubelet
+			// (KEP-4680) in addition to the taint handling (KEP-5055).
+			d.updateDeviceHealth(event)
+			d.applyHealthEventTaint(ctx, event)
 		}
+	}
+}
+
+// applyHealthEventTaint translates a health event into a DRA device taint on
+// the affected devices and republishes the ResourceSlices when anything
+// changed.
+func (d *driver) applyHealthEventTaint(ctx context.Context, event *DeviceHealthEvent) {
+	taint := healthEventToTaint(d.deviceHealthMonitor, event)
+	modified := false
+	for _, dev := range event.Devices {
+		klog.Warningf("Received %s health event for device %s", event.EventType, dev.CanonicalName())
+		if d.state.AddDeviceTaint(dev, taint) {
+			modified = true
+		}
+	}
+	if !modified {
+		return
+	}
+
+	// NOTE: We only log an error on publish failure and do not retry.
+	// If this publish fails, our in-memory health update succeeds but the
+	// ResourceSlice in the API server remains stale and still advertises the
+	// now-unhealthy device as allocatable. Until a later publish succeeds,
+	// the scheduler and other consumers will continue to see the unhealthy
+	// device as available, and new pods may be placed onto hardware we know
+	// is unusable. If publishes continue to fail (e.g., API server issues),
+	// the cluster can remain in this inconsistent state indefinitely.
+	// This is a temporary compromise while device taints/tolerations (KEP-5055)
+	// are available as a Beta feature. An interim improvement could be adding
+	// a retry/backoff or switch to patch updates instead of full republish.
+	klog.V(4).Infof("Republishing ResourceSlice: %d device(s) tainted with %s=%q (effect=%s)",
+		len(event.Devices), taint.Key, taint.Value, taint.Effect)
+
+	// NOTE: GPU_LOST and unmonitored events are already batched at the
+	// sender (all affected devices arrive in a single DeviceHealthEvent).
+	// XID events are still per-device and may cause repeated publishes.
+	// TODO: Add receiver-side event aggregation before PublishResources.
+	// Evaluate two strategies:
+	// 1. Channel drain: non-blocking pull of all pending events (Pro: zero latency; Con: susceptible to NVML lag).
+	// 2. Timer debounce: e.g., 50ms window (Pro: standard K8s API protection; Con: slight delay).
+	// This also needs to be handled properly in the recovery path.
+	if err := d.publishResources(ctx, d.state.config); err != nil {
+		klog.Errorf("Failed to publish resources after taint update: %v", err)
 	}
 }
 

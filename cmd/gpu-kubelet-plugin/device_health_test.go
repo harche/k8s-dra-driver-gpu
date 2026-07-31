@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"testing"
+	"time"
 
 	nvdev "github.com/NVIDIA/go-nvlib/pkg/nvlib/device"
 	"github.com/NVIDIA/go-nvml/pkg/nvml"
@@ -31,11 +32,14 @@ import (
 // mockHealthMonitor implements deviceHealthMonitor for testing healthEventToTaint.
 type mockHealthMonitor struct {
 	nonFatalXids map[uint64]bool
+	heartbeatCh  chan struct{}
+	unhealthyCh  chan *DeviceHealthEvent
 }
 
 func (m *mockHealthMonitor) Start(context.Context) error          { return nil }
 func (m *mockHealthMonitor) Stop()                                {}
-func (m *mockHealthMonitor) Unhealthy() <-chan *DeviceHealthEvent { return nil }
+func (m *mockHealthMonitor) Unhealthy() <-chan *DeviceHealthEvent { return m.unhealthyCh }
+func (m *mockHealthMonitor) Heartbeat() <-chan struct{}           { return m.heartbeatCh }
 func (m *mockHealthMonitor) IsEventNonFatal(e *DeviceHealthEvent) bool {
 	if e.EventType == HealthEventXID {
 		return m.nonFatalXids[e.EventData]
@@ -437,6 +441,71 @@ func TestAllocatableDevicesFindRejectsWrongParent(t *testing.T) {
 		GIID:       2,
 		CIID:       3,
 	}))
+}
+
+// fakeEventSet is an nvml.EventSet whose Wait returns scripted results.
+type fakeEventSet struct {
+	rets  []nvml.Return
+	calls int
+}
+
+func (f *fakeEventSet) Free() nvml.Return { return nvml.SUCCESS }
+func (f *fakeEventSet) Wait(uint32) (nvml.EventData, nvml.Return) {
+	ret := f.rets[len(f.rets)-1]
+	if f.calls < len(f.rets) {
+		ret = f.rets[f.calls]
+	}
+	f.calls++
+	return nvml.EventData{}, ret
+}
+
+// runMonitorFor drives the monitor's event loop against the fake event set
+// until the context expires and reports whether a heartbeat was emitted.
+func runMonitorFor(t *testing.T, rets []nvml.Return, d time.Duration) bool {
+	t.Helper()
+	m := &nvmlDeviceHealthMonitor{
+		eventSet:  &fakeEventSet{rets: rets},
+		unhealthy: make(chan *DeviceHealthEvent, 1),
+		heartbeat: make(chan struct{}, 1),
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), d)
+	defer cancel()
+	m.run(ctx)
+	select {
+	case <-m.heartbeat:
+		return true
+	default:
+		return false
+	}
+}
+
+// TestHealthMonitorHeartbeat_OnlyOnResponsiveWait verifies that only a
+// successful wait or the normal ERROR_TIMEOUT counts as proof the event
+// stream is alive; a persistent NVML failure must let the kubelet's health
+// data expire to unknown rather than keep asserting healthy.
+func TestHealthMonitorHeartbeat_OnlyOnResponsiveWait(t *testing.T) {
+	orig := eventWaitRetryDelay
+	eventWaitRetryDelay = time.Millisecond
+	t.Cleanup(func() { eventWaitRetryDelay = orig })
+
+	assert.True(t, runMonitorFor(t, []nvml.Return{nvml.ERROR_TIMEOUT}, 50*time.Millisecond), "ERROR_TIMEOUT must heartbeat")
+	assert.False(t, runMonitorFor(t, []nvml.Return{nvml.ERROR_UNINITIALIZED}, 50*time.Millisecond), "ERROR_UNINITIALIZED must not heartbeat")
+	assert.False(t, runMonitorFor(t, []nvml.Return{nvml.ERROR_UNKNOWN}, 50*time.Millisecond), "ERROR_UNKNOWN must not heartbeat")
+}
+
+// TestHealthMonitorRun_BacksOffOnError verifies the event loop does not spin
+// when the NVML wait fails immediately with a persistent error.
+func TestHealthMonitorRun_BacksOffOnError(t *testing.T) {
+	orig := eventWaitRetryDelay
+	eventWaitRetryDelay = 20 * time.Millisecond
+	t.Cleanup(func() { eventWaitRetryDelay = orig })
+
+	es := &fakeEventSet{rets: []nvml.Return{nvml.ERROR_UNKNOWN}}
+	m := &nvmlDeviceHealthMonitor{eventSet: es, unhealthy: make(chan *DeviceHealthEvent, 1), heartbeat: make(chan struct{}, 1)}
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	m.run(ctx)
+	assert.LessOrEqual(t, es.calls, 10, "error path must pause between retries")
 }
 
 func TestHealthMonitorStartRequiresRegisteredEvents(t *testing.T) {
