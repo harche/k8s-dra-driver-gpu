@@ -27,10 +27,12 @@ import (
 
 	"github.com/Masterminds/semver/v3"
 	resourceapi "k8s.io/api/resource/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/runtime"
 	coreclientset "k8s.io/client-go/kubernetes"
 	drametadatav1alpha1 "k8s.io/dynamic-resource-allocation/api/metadata/v1alpha1"
+	drametadatav1beta1 "k8s.io/dynamic-resource-allocation/api/metadata/v1beta1"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	"k8s.io/dynamic-resource-allocation/resourceslice"
 	"k8s.io/klog/v2"
@@ -135,12 +137,20 @@ func NewDriver(ctx context.Context, config *Config) (*driver, error) {
 		kubeletplugin.Serialize(false),
 		kubeletplugin.RegistrarDirectoryPath(config.flags.kubeletRegistrarDirectoryPath),
 		kubeletplugin.PluginDataDirectoryPath(config.DriverPluginPath()),
+		// Device health reporting (KEP-4680) is not implemented yet; do not
+		// advertise the DRAResourceHealth service (see also WatchHealthStatus).
+		kubeletplugin.HealthService(false),
 	}
 	// KEP-5304: Enable Device Metadata support for the kubelet plugin implementation.
 	// See: https://github.com/kubernetes/enhancements/tree/master/keps/sig-node/5304-dra-attributes-downward-api
 	if featuregates.Enabled(featuregates.DeviceMetadata) {
-		opts = append(opts, kubeletplugin.EnableDeviceMetadata(true))
-		opts = append(opts, kubeletplugin.MetadataVersions(drametadatav1alpha1.SchemeGroupVersion))
+		// v0.37 requires the metadata versions to be selected explicitly and
+		// to include the latest (v1beta1); v1alpha1 is kept for consumers
+		// which have not been updated yet.
+		opts = append(opts, kubeletplugin.EnableDeviceMetadata(true, []schema.GroupVersion{
+			drametadatav1beta1.SchemeGroupVersion,
+			drametadatav1alpha1.SchemeGroupVersion,
+		}))
 	}
 	helper, err := kubeletplugin.Start(ctx, driver, opts...)
 	if err != nil {
@@ -622,3 +632,12 @@ func getAPIServerVersion(client coreclientset.Interface) (*semver.Version, error
 // 	errors := make(chan error)
 // 	return errors
 // }
+
+// WatchHealthStatus implements [kubeletplugin.DRAPlugin]. The v0.37
+// kubeletplugin helper made this method mandatory; device health reporting
+// (KEP-4680) is not implemented yet, so the service is not advertised (see
+// the HealthService option in NewDriver) and any stray subscription is
+// answered accordingly.
+func (d *driver) WatchHealthStatus(ctx context.Context, reports chan<- kubeletplugin.DeviceHealthReport) error {
+	return kubeletplugin.ErrHealthNotSupported
+}

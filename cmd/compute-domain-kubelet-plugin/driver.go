@@ -116,6 +116,10 @@ func NewDriver(ctx context.Context, config *Config) (*driver, error) {
 		kubeletplugin.Serialize(false),
 		kubeletplugin.RegistrarDirectoryPath(config.flags.kubeletRegistrarDirectoryPath),
 		kubeletplugin.PluginDataDirectoryPath(config.DriverPluginPath()),
+		// The ComputeDomain plugin does not report device health (KEP-4680);
+		// do not advertise the DRAResourceHealth service (see also
+		// WatchHealthStatus).
+		kubeletplugin.HealthService(false),
 	)
 	if err != nil {
 		return nil, err
@@ -335,3 +339,11 @@ func (d *driver) deleteExpiredPrepareAbortedClaimEntries(ctx context.Context, no
 // 	errors := make(chan error)
 // 	return errors
 // }
+
+// WatchHealthStatus implements [kubeletplugin.DRAPlugin]. The v0.37
+// kubeletplugin helper made this method mandatory; the ComputeDomain plugin
+// does not report device health (see also the HealthService option in
+// NewDriver).
+func (d *driver) WatchHealthStatus(ctx context.Context, reports chan<- kubeletplugin.DeviceHealthReport) error {
+	return kubeletplugin.ErrHealthNotSupported
+}
