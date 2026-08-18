@@ -42,6 +42,55 @@
 {{- fail $error }}
 {{- end }}
 
+{{- $gpuBindingConditions := and .Values.featureGates (and (hasKey .Values.featureGates "GPUBindingConditions") .Values.featureGates.GPUBindingConditions) }}
+{{- $profileIds := (.Values.powerReadiness | default dict).profileIds | default list }}
+{{- $bc := .Values.bindingConditions | default list }}
+{{- $bfc := .Values.bindingFailureConditions | default list }}
+{{- if $profileIds }}
+{{- $bc = append $bc "gpu.nvidia.com/power-ready" | uniq }}
+{{- $bfc = append $bfc "gpu.nvidia.com/power-failed" | uniq }}
+{{- end }}
+
+{{- if or .Values.bindingConditions .Values.bindingFailureConditions }}
+{{- if not $gpuBindingConditions }}
+{{- $error := "" }}
+{{- $error = printf "%s\n\n'bindingConditions'/'bindingFailureConditions' are set, but the 'GPUBindingConditions' feature gate is not enabled." $error }}
+{{- $error = printf "%s\nThe kubelet plugin refuses to start in that combination, so this would take the 'gpus' container into CrashLoopBackOff on every node." $error }}
+{{- $error = printf "%s\n" $error }}
+{{- $error = printf "%s\n    --set 'featureGates.GPUBindingConditions=true'" $error }}
+{{- fail $error }}
+{{- end }}
+{{- end }}
+
+{{- if or $bc $bfc }}
+{{- if or (not $bc) (not $bfc) }}
+{{- $error := "" }}
+{{- $error = printf "%s\n\nBinding conditions and binding failure conditions must be set together (effective lists: %v / %v)." $error $bc $bfc }}
+{{- $error = printf "%s\nThe API server rejects any ResourceSlice whose devices carry one without the other, which would make this node's GPUs disappear from the cluster." $error }}
+{{- fail $error }}
+{{- end }}
+{{- if or (gt (len $bc) 4) (gt (len $bfc) 4) }}
+{{- $error := "" }}
+{{- $error = printf "%s\n\nAt most 4 binding conditions and 4 binding failure conditions are allowed; this configuration produces %d and %d." $error (len $bc) (len $bfc) }}
+{{- if $profileIds }}
+{{- $error = printf "%s\nNote that 'powerReadiness.profileIds' adds one to each list (gpu.nvidia.com/power-ready and gpu.nvidia.com/power-failed)." $error }}
+{{- end }}
+{{- $error = printf "%s\nThe kubelet plugin refuses to start otherwise." $error }}
+{{- fail $error }}
+{{- end }}
+{{- end }}
+
+{{- if $profileIds }}
+{{- if not $gpuBindingConditions }}
+{{- $error := "" }}
+{{- $error = printf "%s\n\n'powerReadiness.profileIds' is set, but the 'GPUBindingConditions' feature gate is not enabled." $error }}
+{{- $error = printf "%s\nThe kubelet plugin refuses to start in that combination." $error }}
+{{- $error = printf "%s\n" $error }}
+{{- $error = printf "%s\n    --set 'featureGates.GPUBindingConditions=true'" $error }}
+{{- fail $error }}
+{{- end }}
+{{- end }}
+
 {{- if .Values.nvidiaCtkPath }}
 {{- $error := "" }}
 {{- $error = printf "%s\nSetting a user-defined nvidiaCtkPath is no longer supported. It can simply be removed without consequence." $error }}

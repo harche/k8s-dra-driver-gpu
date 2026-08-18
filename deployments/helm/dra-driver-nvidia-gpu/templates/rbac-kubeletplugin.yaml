@@ -11,6 +11,22 @@ rules:
 - apiGroups: ["resource.k8s.io"]
   resources: ["resourceclaims"]
   verbs: ["get", "list", "watch"]
+{{- if (.Values.powerReadiness | default dict).profileIds }}
+# Required to satisfy KEP-5007 binding conditions from the node: the plugin
+# marks the configured condition True in ResourceClaim.status.devices once the
+# allocated GPUs report a sufficient enforced power limit.
+- apiGroups: ["resource.k8s.io"]
+  resources: ["resourceclaims/status"]
+  verbs: ["update"]
+# Kubernetes 1.36+ additionally enforces per-driver authorization for
+# status.devices writes via DRAResourceClaimGranularStatusAuthorization. As a
+# node-local writer we use the "associated-node" verbs for our own driver name.
+# This rule is inert on clusters where that gate is off.
+- apiGroups: ["resource.k8s.io"]
+  resources: ["resourceclaims/driver"]
+  verbs: ["associated-node:update", "associated-node:patch"]
+  resourceNames: ["gpu.nvidia.com"]
+{{- end }}
 - apiGroups: ["resource.k8s.io"]
   resources: ["resourceslices"]
   verbs: ["get", "list", "watch", "create", "update", "delete"]

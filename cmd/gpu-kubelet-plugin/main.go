@@ -68,6 +68,9 @@ type Flags struct {
 	klogVerbosity                 int
 	additionalXidsToIgnore        string
 	consumableShares              string
+	bindingConditions             string
+	bindingFailureConditions      string
+	powerReadinessProfileIDs      string
 }
 
 type Config struct {
@@ -75,6 +78,8 @@ type Config struct {
 	clientsets           pkgflags.ClientSets
 	imagePullSecretNames []string
 	imagePullPolicy      string
+	bindingConditions    bindingConditionsConfig
+	powerReadiness       powerReadinessConfig
 }
 
 func (c Config) DriverPluginPath() string {
@@ -217,6 +222,24 @@ func newApp() *cli.App {
 			Destination: &flags.consumableShares,
 			EnvVars:     []string{"CONSUMABLE_SHARES"},
 		},
+		&cli.StringFlag{
+			Name:        "binding-conditions",
+			Usage:       "Comma-separated KEP-5007 binding condition types to publish on this driver's devices (e.g. 'power.nvidia.com/ready'). All of them must be set to True in the ResourceClaim's per-device status by an external controller before the scheduler binds a pod. Must be set together with --binding-failure-conditions. Requires the GPUBindingConditions feature gate here, and the DRADeviceBindingConditions and DRAResourceClaimDeviceStatus feature gates on both the apiserver and the scheduler. Empty by default; configuring this without deploying a controller that satisfies the conditions prevents all GPU pods from binding.",
+			Destination: &flags.bindingConditions,
+			EnvVars:     []string{"BINDING_CONDITIONS"},
+		},
+		&cli.StringFlag{
+			Name:        "power-readiness-profile-ids",
+			Usage:       "Comma-separated NVIDIA workload power profile IDs that must be enforced on a GPU before a pod may bind to it. Setting this makes the driver publish and satisfy its own binding conditions (gpu.nvidia.com/power-ready and gpu.nvidia.com/power-failed), holding a pod until NVML reports every configured profile as enforced on each GPU allocated to it from this node. This mirrors the dps_wpps setting NVIDIA DPS applies from a Slurm prolog, for which Kubernetes has no equivalent hook. Applying the profiles remains the power manager's job; this only waits for them. GPUs that cannot report profiles (pre-Blackwell, or bound to vfio-pci) are treated as ready. Unset by default, in which case an external controller is expected to satisfy any conditions from --binding-conditions. Requires the GPUBindingConditions feature gate, and consumes one of the four available binding condition slots.",
+			Destination: &flags.powerReadinessProfileIDs,
+			EnvVars:     []string{"POWER_READINESS_PROFILE_IDS"},
+		},
+		&cli.StringFlag{
+			Name:        "binding-failure-conditions",
+			Usage:       "Comma-separated KEP-5007 binding failure condition types to publish on this driver's devices (e.g. 'power.nvidia.com/failed'). If an external controller sets any of them to True, the scheduler aborts binding and reschedules the pod. Required when --binding-conditions is set, and vice versa.",
+			Destination: &flags.bindingFailureConditions,
+			EnvVars:     []string{"BINDING_FAILURE_CONDITIONS"},
+		},
 	}
 	cliFlags = append(cliFlags, flags.kubeClientConfig.Flags()...)
 	cliFlags = append(cliFlags, featureGateConfig.Flags()...)
@@ -256,11 +279,30 @@ func newApp() *cli.App {
 				return fmt.Errorf("create client: %w", err)
 			}
 
+			profileIDs, err := parseProfileIDs(flags.powerReadinessProfileIDs)
+			if err != nil {
+				return fmt.Errorf("invalid power readiness settings: %w", err)
+			}
+			powerReadiness := powerReadinessConfig{
+				profileIDs: profileIDs,
+				interval:   defaultPowerReadinessInterval,
+			}
+			if err := powerReadiness.validate(); err != nil {
+				return fmt.Errorf("invalid power readiness settings: %w", err)
+			}
+
+			bindingConditions, err2 := newBindingConditionsConfig(flags.bindingConditions, flags.bindingFailureConditions, powerReadiness)
+			if err = err2; err != nil {
+				return fmt.Errorf("invalid binding conditions: %w", err)
+			}
+
 			config := &Config{
 				flags:                flags,
 				clientsets:           clientSets,
 				imagePullSecretNames: strings.Fields(strings.ReplaceAll(strings.TrimSpace(flags.imagePullSecrets), ",", " ")),
 				imagePullPolicy:      strings.TrimSpace(flags.imagePullPolicy),
+				bindingConditions:    bindingConditions,
+				powerReadiness:       powerReadiness,
 			}
 
 			return RunPlugin(c.Context, config)
@@ -301,6 +343,26 @@ func validateCLIFlags(flags *Flags) error {
 			}
 			return fmt.Errorf("error checking if host root is mounted at %q: %w", flags.hostRoot, err)
 		}
+	}
+
+	if (flags.bindingConditions != "" || flags.bindingFailureConditions != "") && !featuregates.Enabled(featuregates.GPUBindingConditions) {
+		return fmt.Errorf("--binding-conditions/--binding-failure-conditions require feature gate %s to be enabled", featuregates.GPUBindingConditions)
+	}
+
+	if flags.powerReadinessProfileIDs != "" && !featuregates.Enabled(featuregates.GPUBindingConditions) {
+		return fmt.Errorf("--power-readiness-profile-ids requires feature gate %s to be enabled", featuregates.GPUBindingConditions)
+	}
+
+	profileIDs, err := parseProfileIDs(flags.powerReadinessProfileIDs)
+	if err != nil {
+		return err
+	}
+	pr := powerReadinessConfig{profileIDs: profileIDs}
+	if err := pr.validate(); err != nil {
+		return err
+	}
+	if _, err := newBindingConditionsConfig(flags.bindingConditions, flags.bindingFailureConditions, pr); err != nil {
+		return err
 	}
 
 	if flags.consumableShares != "disabled" && !featuregates.Enabled(featuregates.ConsumableShares) {

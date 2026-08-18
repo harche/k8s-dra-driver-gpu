@@ -41,6 +41,84 @@ gpuResourcesEnabledOverride: false
 # Configure consumable shares support ("disabled", "memory", "unlimited", or a positive integer)
 consumableShares: ""
 
+# KEP-5007 device binding conditions published on this driver's GPU devices.
+#
+# The scheduler holds a pod in PreBind until every condition type listed in
+# bindingConditions is True in the ResourceClaim's per-device status, and
+# reschedules the pod if any type in bindingFailureConditions becomes True.
+# This lets an external controller gate pod binding on device readiness the
+# driver cannot observe itself, e.g. an out-of-band power-management service
+# bringing GPUs to their target power state before a workload starts.
+#
+# This driver only publishes the condition types; it never satisfies them.
+# WARNING: setting bindingConditions without deploying a controller that writes
+# these conditions prevents every pod requesting a GPU from this driver from
+# ever binding: each one waits for the scheduler's binding timeout (10 minutes
+# by default) and is then rescheduled, indefinitely.
+#
+# Requires featureGates.GPUBindingConditions=true here, and the
+# DRADeviceBindingConditions and DRAResourceClaimDeviceStatus feature gates on
+# BOTH the kube-apiserver and the kube-scheduler. A scheduler without them
+# treats every device carrying binding conditions as unselectable, so all GPU
+# pods stay Pending with no available devices -- and because the API server
+# stored the fields just fine, nothing in this driver's logs will say why.
+# DRADeviceBindingConditions is beta and on by default since Kubernetes 1.36.
+#
+# The two lists must be set together: the API server rejects a device that
+# carries one without the other. At most 4 entries each; entries must be valid
+# condition types (label names) and must not overlap.
+#
+# Example:
+#   bindingConditions:
+#     - power.nvidia.com/ready
+#   bindingFailureConditions:
+#     - power.nvidia.com/failed
+bindingConditions: []
+bindingFailureConditions: []
+
+# powerReadiness lets this driver gate binding on GPU workload power profiles by
+# itself, instead of relying on an external controller.
+#
+# Setting profileIds makes the driver publish its own condition pair
+# (gpu.nvidia.com/power-ready and gpu.nvidia.com/power-failed) and hold a pod
+# before binding until NVML reports every listed profile as enforced on each GPU
+# allocated to it from that node.
+#
+# This mirrors what NVIDIA DPS already does on Slurm, where a job carries
+# dps_wpps in its comment and a prolog runs dpsctl to apply those profiles to the
+# allocated nodes before the job starts. Kubernetes has no prolog, and binding
+# conditions are the closest equivalent.
+#
+# The driver only waits; applying the profiles remains the power manager's job.
+# If nothing applies them, the condition never becomes true and pods requesting
+# these GPUs wait out the scheduler's binding timeout, so only enable this
+# alongside something that does apply them.
+#
+# Readiness is taken from NVML's enforced profile mask, which DPS documents as
+# the profiles "currently active on the GPU" after the firmware arbitrates
+# between requested ones. A profile that was requested but lost arbitration is
+# therefore not treated as ready.
+#
+# The IDs are the ones DPS uses, matching dpsctl --workload-profile-ids, and run
+# from 3 to 257 here. DPS applies profiles out of band over Redfish and its
+# numbering is three higher than the value nvidia-smi reports for the same
+# profile, so passing an nvidia-smi value would silently never match. The driver
+# converts before reading the NVML mask.
+#
+# WPPS is not supported before Blackwell. GPUs that cannot report profiles,
+# including any bound to vfio-pci, are treated as ready and logged. Only the
+# readiness condition is ever set; a GPU running a different profile is not a
+# binding failure.
+#
+# Enabling this consumes one of the four binding condition slots. Requires
+# featureGates.GPUBindingConditions=true.
+#
+# Example, matching `dpsctl resource-group create --workload-profile-ids 5,7`:
+#   powerReadiness:
+#     profileIds: [5, 7]
+powerReadiness:
+  profileIds: []
+
 allowDefaultNamespace: false
 
 # resourceApiVersion sets the resource.k8s.io API version used for DRA resources (DeviceClass,
@@ -118,6 +196,7 @@ resources:
 #   HostManagedIMEXDaemon: false       # Gate allowing resources.computeDomains.imex.mode=hostManaged
 #   DRAListTypeAttributes: false       # Publish list-valued DRA device attributes
 #   ConsumableShares: false            # Publish consumable capacity and multi-allocation support for devices
+#   GPUBindingConditions: false        # Publish KEP-5007 binding conditions on GPU devices (see bindingConditions)
 featureGates: {}
 
 # Log verbosity for all components. Zero or greater, higher number means higher

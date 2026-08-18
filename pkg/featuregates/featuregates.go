@@ -97,6 +97,20 @@ const (
 	// of the same name enabled before enabling this in the driver.
 	DRAListTypeAttributes featuregate.Feature = "DRAListTypeAttributes"
 
+	// GPUBindingConditions enables publishing operator-configured KEP-5007
+	// binding conditions on the GPU devices advertised by the GPU kubelet
+	// plugin, via --binding-conditions / --binding-failure-conditions.
+	//
+	// The driver only publishes the condition types; an external controller
+	// must satisfy them by writing to claim.status.devices[].conditions (for
+	// example a power-management service that brings GPUs to their target
+	// power state before a workload is allowed to start). With condition types
+	// configured but no such writer deployed, every pod requesting a GPU from
+	// this driver waits for the scheduler's binding timeout and is then
+	// rescheduled. The cluster must have the Kubernetes DRADeviceBindingConditions
+	// and DRAResourceClaimDeviceStatus feature gates enabled.
+	GPUBindingConditions featuregate.Feature = "GPUBindingConditions"
+
 	// ConsumableShares enables publishing consumable capacity and multi-allocation
 	// (AllowMultipleAllocations) support for devices in ResourceSlices, allowing
 	// multiple ResourceClaims to share the same GPU or MIG device when configured
@@ -199,6 +213,13 @@ var defaultFeatureGates = map[featuregate.Feature]featuregate.VersionedSpecs{
 		},
 	},
 	ConsumableShares: {
+		{
+			Default:    false,
+			PreRelease: featuregate.Alpha,
+			Version:    version.MajorMinor(0, 5),
+		},
+	},
+	GPUBindingConditions: {
 		{
 			Default:    false,
 			PreRelease: featuregate.Alpha,

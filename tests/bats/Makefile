@@ -189,6 +189,7 @@ tests-mock-nvml: MOCK_NVML := true
 tests-mock-nvml: runner-image
 	$(call RUN_BATS, \
 		tests/bats/test_gpu_basic.bats \
+		tests/bats/test_gpu_binding_conditions.bats \
 		tests/bats/test_gpu_cuda_workloads.bats \
 		tests/bats/test_gpu_sharing.bats \
 		tests/bats/test_gpu_robustness.bats \
@@ -206,6 +207,7 @@ tests-mock-nvml: runner-image
 tests-gpu-single: runner-image
 	$(call RUN_BATS, \
 		tests/bats/test_gpu_basic.bats \
+		tests/bats/test_gpu_binding_conditions.bats \
 		tests/bats/test_gpu_cuda_workloads.bats \
 		tests/bats/test_gpu_dynmig.bats \
 		tests/bats/test_gpu_sharing.bats \

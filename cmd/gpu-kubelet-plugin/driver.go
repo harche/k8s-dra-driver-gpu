@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"path/filepath"
@@ -67,6 +68,9 @@ type driver struct {
 	// Devices (required for k8s 1.35+) or combined SharedCounters and Devices
 	// in the same slice (required for k8s 1.34).
 	useSplitResourceSlices bool
+	// KEP-5007 binding condition types published on this driver's devices,
+	// satisfied by an external controller. Empty unless configured.
+	bindingConditions bindingConditionsConfig
 }
 
 func NewDriver(ctx context.Context, config *Config) (*driver, error) {
@@ -128,6 +132,32 @@ func NewDriver(ctx context.Context, config *Config) (*driver, error) {
 		state:                  state,
 		pulock:                 flock.NewFlock(puLockPath),
 		useSplitResourceSlices: useSplitSlices,
+		bindingConditions:      config.bindingConditions,
+	}
+
+	if config.powerReadiness.enabled() {
+		// Started before any ResourceSlice is published: if the writer cannot
+		// run, this driver must not advertise a binding condition that nothing
+		// will ever satisfy.
+		writer := newPowerReadinessWriter(config, state)
+		runWriter, err := writer.Start(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("starting power readiness writer: %w", err)
+		}
+		driver.wg.Add(1)
+		go func() {
+			defer driver.wg.Done()
+			runWriter()
+		}()
+	}
+
+	if driver.bindingConditions.enabled() {
+		klog.Infof("Publishing KEP-5007 binding conditions %v (failure conditions %v) on all devices. "+
+			"Pods requesting these devices will not bind until an external controller sets those "+
+			"conditions to True in claim.status.devices[]. This requires the DRADeviceBindingConditions "+
+			"and DRAResourceClaimDeviceStatus feature gates on both the kube-apiserver and the "+
+			"kube-scheduler; a scheduler without them treats these devices as unselectable.",
+			driver.bindingConditions.conditions, driver.bindingConditions.failureConditions)
 	}
 
 	opts := []kubeletplugin.Option{
@@ -376,7 +406,22 @@ func (d *driver) UnprepareResourceClaims(ctx context.Context, claimRefs []kubele
 }
 
 func (d *driver) HandleError(ctx context.Context, err error, msg string) {
-	// For now we just follow the advice documented in the DRAPlugin API docs.
+	// A DroppedFieldsError means the apiserver stored less than we asked for.
+	// The resourceslice helper reacts by rewriting its own desired state to
+	// match what was stored, so it never retries: the feature stays inert
+	// until this plugin is restarted. That is easy to miss, so call it out
+	// instead of letting it scroll past as a generic error.
+	var dropped *resourceslice.DroppedFieldsError
+	if errors.As(err, &dropped) && d.bindingConditions.enabled() &&
+		slices.Contains(dropped.DisabledFeatures(), "DRADeviceBindingConditions") {
+		klog.Errorf("The apiserver dropped the binding conditions published for pool %q, slice #%d. "+
+			"--binding-conditions has no effect unless the cluster has the DRADeviceBindingConditions and "+
+			"DRAResourceClaimDeviceStatus feature gates enabled; pods will bind without waiting for these "+
+			"conditions. Published slices have been downgraded to match the apiserver, so this plugin must be "+
+			"restarted after enabling the gates.", dropped.PoolName, dropped.SliceIndex)
+	}
+
+	// Otherwise we just follow the advice documented in the DRAPlugin API docs.
 	// See: https://pkg.go.dev/k8s.io/apimachinery/pkg/util/runtime#HandleErrorWithContext
 	runtime.HandleErrorWithContext(ctx, err, msg)
 }
@@ -479,6 +524,7 @@ func (d *driver) publishResources(ctx context.Context, config *Config) error {
 		// https://github.com/kubernetes/kubernetes/commit/a171795e313ee9f407fef4897c1a1e2052120991
 		klog.V(1).Infof("featuregates.DynamicMIG enabled: construct ResourceSlice objects according to KEP 4815 (partitionable devices)")
 		resources := d.GenerateDriverResources(config.flags.nodeName)
+		config.bindingConditions.applyToResources(resources)
 		if err := d.pluginhelper.PublishResources(ctx, resources); err != nil {
 			return err
 		}
@@ -499,6 +545,7 @@ func (d *driver) publishResources(ctx context.Context, config *Config) error {
 			config.flags.nodeName: {Slices: []resourceslice.Slice{resourceSlice}},
 		},
 	}
+	config.bindingConditions.applyToResources(resources)
 
 	if err := d.pluginhelper.PublishResources(ctx, resources); err != nil {
 		return err
@@ -566,6 +613,7 @@ func (d *driver) deviceHealthEvents(ctx context.Context, nodeName string) {
 					nodeName: {Slices: []resourceslice.Slice{resourceSlice}},
 				},
 			}
+			d.bindingConditions.applyToResources(resources)
 
 			// NOTE: GPU_LOST and unmonitored events are already batched at the
 			// sender (all affected devices arrive in a single DeviceHealthEvent).

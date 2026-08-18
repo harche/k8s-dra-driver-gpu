@@ -309,6 +309,18 @@ spec:
         - name: CONSUMABLE_SHARES
           value: "{{ .Values.consumableShares }}"
         {{- end }}
+        {{- if .Values.bindingConditions }}
+        - name: BINDING_CONDITIONS
+          value: "{{ join "," .Values.bindingConditions }}"
+        {{- end }}
+        {{- if .Values.bindingFailureConditions }}
+        - name: BINDING_FAILURE_CONDITIONS
+          value: "{{ join "," .Values.bindingFailureConditions }}"
+        {{- end }}
+        {{- if (.Values.powerReadiness | default dict).profileIds }}
+        - name: POWER_READINESS_PROFILE_IDS
+          value: "{{- range $i, $v := .Values.powerReadiness.profileIds }}{{ if $i }},{{ end }}{{ $v }}{{ end }}"
+        {{- end }}
         {{- if .Values.featureGates }}
         - name: FEATURE_GATES
           value: "{{ range $key, $value := .Values.featureGates }}{{ $key }}={{ $value }},{{ end }}"
